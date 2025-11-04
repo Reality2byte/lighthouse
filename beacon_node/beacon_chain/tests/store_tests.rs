@@ -1561,7 +1561,7 @@ async fn proposer_duties_from_head_fulu() {
 
     // Compute the proposer duties at the next epoch from the head
     let next_epoch = head_state.next_epoch().unwrap();
-    let (_indices, dependent_root, _, fork) =
+    let (_indices, dependent_root, legacy_dependent_root, _, fork) =
         compute_proposer_duties_from_head(next_epoch, &harness.chain).unwrap();
 
     assert_eq!(
@@ -1570,6 +1570,8 @@ async fn proposer_duties_from_head_fulu() {
             .proposer_shuffling_decision_root_at_epoch(next_epoch, head_block_root.into(), spec)
             .unwrap()
     );
+    assert_ne!(dependent_root, legacy_dependent_root);
+    assert_eq!(legacy_dependent_root, Hash256::from(head_block_root));
     assert_eq!(fork, head_state.fork());
 }
 
@@ -1617,7 +1619,7 @@ async fn proposer_lookahead_gloas_fork_epoch() {
     assert_eq!(head_state.current_epoch(), gloas_fork_epoch - 1);
 
     // Compute the proposer duties at the fork epoch from the head.
-    let (indices, dependent_root, _, fork) =
+    let (indices, dependent_root, legacy_dependent_root, _, fork) =
         compute_proposer_duties_from_head(gloas_fork_epoch, &harness.chain).unwrap();
 
     assert_eq!(
@@ -1630,6 +1632,7 @@ async fn proposer_lookahead_gloas_fork_epoch() {
             )
             .unwrap()
     );
+    assert_ne!(dependent_root, legacy_dependent_root);
     assert_ne!(fork, head_state.fork());
     assert_eq!(fork, spec.fork_at_epoch(gloas_fork_epoch));
 
@@ -1639,7 +1642,7 @@ async fn proposer_lookahead_gloas_fork_epoch() {
         .add_attested_blocks_at_slots(head_state, head_state_root, &gloas_slots, &all_validators)
         .await;
 
-    let (no_lookahead_indices, no_lookahead_dependent_root, _, no_lookahead_fork) =
+    let (no_lookahead_indices, no_lookahead_dependent_root, _, _, no_lookahead_fork) =
         compute_proposer_duties_from_head(gloas_fork_epoch, &harness.chain).unwrap();
 
     assert_eq!(no_lookahead_indices, indices);
@@ -3182,6 +3185,8 @@ async fn weak_subjectivity_sync_test(
     assert_eq!(store.get_anchor_info().state_upper_limit, Slot::new(0));
 }
 
+// This test prunes data columns from epoch 0 and then tries to re-import them via
+// the same code paths that custody backfill sync imports data columns
 #[tokio::test]
 async fn test_import_historical_data_columns_batch() {
     let spec = ForkName::Fulu.make_genesis_spec(E::default_spec());
@@ -3189,6 +3194,7 @@ async fn test_import_historical_data_columns_batch() {
     let store = get_store_generic(&db_path, StoreConfig::default(), spec);
     let start_slot = Epoch::new(0).start_slot(E::slots_per_epoch()) + 1;
     let end_slot = Epoch::new(0).end_slot(E::slots_per_epoch());
+    let cgc = 128;
 
     let harness = get_harness_import_all_data_columns(store.clone(), LOW_VALIDATOR_COUNT);
 
@@ -3208,6 +3214,7 @@ async fn test_import_historical_data_columns_batch() {
 
     let mut data_columns_list = vec![];
 
+    // Get all data columns for epoch 0
     for block in block_root_iter {
         let (block_root, _) = block.unwrap();
         let data_columns = harness.chain.store.get_data_columns(&block_root).unwrap();
@@ -3228,6 +3235,7 @@ async fn test_import_historical_data_columns_batch() {
 
     harness.advance_slot();
 
+    // Prune data columns
     harness
         .chain
         .store
@@ -3239,21 +3247,25 @@ async fn test_import_historical_data_columns_batch() {
         .forwards_iter_block_roots_until(start_slot, end_slot)
         .unwrap();
 
+    // Assert that data columns no longer exist for epoch 0
     for block in block_root_iter {
         let (block_root, _) = block.unwrap();
         let data_columns = harness.chain.store.get_data_columns(&block_root).unwrap();
         assert!(data_columns.is_none())
     }
 
+    // Re-import deleted data columns
     harness
         .chain
-        .import_historical_data_column_batch(Epoch::new(0), data_columns_list)
+        .import_historical_data_column_batch(Epoch::new(0), data_columns_list, cgc)
         .unwrap();
+
     let block_root_iter = harness
         .chain
         .forwards_iter_block_roots_until(start_slot, end_slot)
         .unwrap();
 
+    // Assert that data columns now exist for epoch 0
     for block in block_root_iter {
         let (block_root, _) = block.unwrap();
         if !harness
@@ -3272,6 +3284,7 @@ async fn test_import_historical_data_columns_batch() {
 }
 
 // This should verify that a data column sidecar containing mismatched block roots should fail to be imported.
+// This also covers any test cases related to data columns with incorrect/invalid/mismatched block roots.
 #[tokio::test]
 async fn test_import_historical_data_columns_batch_mismatched_block_root() {
     let spec = ForkName::Fulu.make_genesis_spec(E::default_spec());
@@ -3279,6 +3292,7 @@ async fn test_import_historical_data_columns_batch_mismatched_block_root() {
     let store = get_store_generic(&db_path, StoreConfig::default(), spec);
     let start_slot = Slot::new(1);
     let end_slot = Slot::new(E::slots_per_epoch() * 2 - 1);
+    let cgc = 128;
 
     let harness = get_harness_import_all_data_columns(store.clone(), LOW_VALIDATOR_COUNT);
 
@@ -3298,6 +3312,8 @@ async fn test_import_historical_data_columns_batch_mismatched_block_root() {
 
     let mut data_columns_list = vec![];
 
+    // Get all data columns from start_slot to end_slot
+    // and mutate the data columns with an invalid block root
     for block in block_root_iter {
         let (block_root, _) = block.unwrap();
         let data_columns = harness.chain.store.get_data_columns(&block_root).unwrap();
@@ -3323,6 +3339,7 @@ async fn test_import_historical_data_columns_batch_mismatched_block_root() {
 
     harness.advance_slot();
 
+    // Prune blobs
     harness
         .chain
         .store
@@ -3334,17 +3351,20 @@ async fn test_import_historical_data_columns_batch_mismatched_block_root() {
         .forwards_iter_block_roots_until(start_slot, end_slot)
         .unwrap();
 
+    // Assert there are no columns between start_slot and end_slot
     for block in block_root_iter {
         let (block_root, _) = block.unwrap();
         let data_columns = harness.chain.store.get_data_columns(&block_root).unwrap();
         assert!(data_columns.is_none())
     }
 
+    // Attempt to import data columns with invalid block roots and expect a failure
     let error = harness
         .chain
         .import_historical_data_column_batch(
             start_slot.epoch(E::slots_per_epoch()),
             data_columns_list,
+            cgc,
         )
         .unwrap_err();
 
@@ -3367,6 +3387,7 @@ async fn test_import_historical_data_columns_batch_no_block_found() {
     let store = get_store_generic(&db_path, StoreConfig::default(), spec);
     let start_slot = Slot::new(1);
     let end_slot = Slot::new(E::slots_per_epoch() * 2 - 1);
+    let cgc = 128;
 
     let harness = get_harness_import_all_data_columns(store.clone(), LOW_VALIDATOR_COUNT);
 
@@ -3428,7 +3449,7 @@ async fn test_import_historical_data_columns_batch_no_block_found() {
 
     let error = harness
         .chain
-        .import_historical_data_column_batch(Epoch::new(0), data_columns_list)
+        .import_historical_data_column_batch(Epoch::new(0), data_columns_list, cgc)
         .unwrap_err();
 
     assert!(matches!(
